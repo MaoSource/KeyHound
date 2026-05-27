@@ -648,13 +648,21 @@ pub fn streaming_hash_match(
         }
     };
 
+    // 哈希反查的"文本字节": 0x20-0x7e 之外, 还允许 0x09/0x0a/0x0d。
+    // HTTP request body / JSON / 表单 form-data 这类被 hash 的明文经常含 \n \r \t,
+    // 如果只认 0x20-0x7e 会被换行切碎导致整段进不了 hash 比对。
+    #[inline]
+    fn is_hash_text_byte(b: u8) -> bool {
+        matches!(b, 0x09 | 0x0a | 0x0d) || (0x20..=0x7e).contains(&b)
+    }
+
     let total_bytes: u64 = sources.iter().map(|s| s.len() as u64).sum::<u64>().max(1);
     let mut bytes_done_prior: u64 = 0;
     'sources: for (src_idx, src_arc) in sources.iter().enumerate() {
         let src: &[u8] = src_arc.as_slice();
         let mut start: Option<usize> = None;
         for (i, &b) in src.iter().enumerate() {
-            let is_print = (0x20..=0x7e).contains(&b);
+            let is_print = is_hash_text_byte(b);
             if is_print {
                 if start.is_none() {
                     start = Some(i);
@@ -719,12 +727,82 @@ pub fn streaming_hash_match(
         }
     }
 
+    // 第二遍: UTF-16 LE 扫描。Windows 进程里 .NET / WinRT / 大量 Win32 API 的
+    // 字符串都以 UTF-16 LE 存储 (每个 ASCII 字符后跟一个 0x00)。第一遍按
+    // 0x20-0x7e 切分会把这种串在每个 0x00 处切碎, 整段拼接的明文 (HTTP body /
+    // JSON) 永远进不了 hash 反查。这里把"ASCII 字符 + 0x00"成对的连续段重新
+    // 抽出来作为候选。
+    let utf16_scanned_before = scanned_strings;
+    bytes_done_prior = 0; // 复用 total_bytes 作分母, 重置已完成字节量
+    'sources16: for (src_idx, src_arc) in sources.iter().enumerate() {
+        let src: &[u8] = src_arc.as_slice();
+        let n = src.len();
+        let mut i = 0usize;
+        while i + 1 < n {
+            // 在 i 处尝试识别 UTF-16 LE ASCII run
+            let mut j = i;
+            while j + 1 < n {
+                let c = src[j];
+                let h = src[j + 1];
+                if is_hash_text_byte(c) && h == 0x00 {
+                    j += 2;
+                } else {
+                    break;
+                }
+            }
+            let chars = (j - i) / 2;
+            if chars >= min_len {
+                if chars <= max_len {
+                    let mut bytes: Vec<u8> = Vec::with_capacity(chars);
+                    let mut k = i;
+                    while k < j {
+                        bytes.push(src[k]);
+                        k += 2;
+                    }
+                    try_match(
+                        &bytes,
+                        &mut seen,
+                        &mut hits,
+                        &mut scanned_strings,
+                        tx,
+                    );
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+
+            // 周期性 stop / progress
+            if i & 0x7F_FFFF == 0 && i > 0 {
+                if stop.load(Ordering::Relaxed) {
+                    break 'sources16;
+                }
+                let pct = ((bytes_done_prior + i as u64) as f64 / total_bytes as f64
+                    * 100.0) as f32;
+                send(
+                    tx,
+                    EngineMsg::Progress {
+                        pct,
+                        current: format!(
+                            "流式哈希反查 (UTF-16) {}/{}",
+                            src_idx + 1,
+                            sources.len()
+                        ),
+                    },
+                );
+            }
+        }
+        bytes_done_prior += src.len() as u64;
+    }
+
     log(
         tx,
         MsgLvl::Info,
         format!(
-            "流式哈希反查完成 · 共扫描 {} 个去重后字符串 · 命中 {} 项",
-            scanned_strings, hits
+            "流式哈希反查完成 · 共扫描 {} 个去重后字符串 (UTF-16 二遍补 {} 个) · 命中 {} 项",
+            scanned_strings,
+            scanned_strings - utf16_scanned_before,
+            hits
         ),
         false,
     );
@@ -1841,8 +1919,8 @@ fn run_job(
                         format!(
                             "流式 {} 反查扫完整个 dump 均未命中。可能原因:\
                              (1) 明文不在该 dump 里; \
-                             (2) 明文含非可打印字节 (0x00-0x1f / 0x7f / 0x80-0xff) 被切碎;\
-                             (3) 明文是更长 ASCII 段的子串, 整段被当成一条 hash 候选;\
+                             (2) 明文含 NUL / 0x80-0xff 等切分字节 (常见: UTF-8 中文 / 二进制头);\
+                             (3) 明文是更长文本段的子串, 整段被当成一条 hash 候选;\
                              (4) dump 里的明文已被覆盖 / 释放。\
                              可直接在 '已知明文' 字段贴入候选明文验证",
                             h
@@ -2110,6 +2188,111 @@ mod tests {
             }
         }
         assert!(found_plaintext, "Hit 消息应包含正确的明文");
+    }
+
+    /// 回归: Windows 进程里字符串多以 UTF-16 LE 存储 (每个 ASCII 字符后跟一个
+    /// 0x00 字节)。第一遍 ASCII 扫描会把 UTF-16 串在每个 0x00 处切碎, 应该靠
+    /// 第二遍 UTF-16 扫描兜住。
+    #[test]
+    fn streaming_hash_finds_utf16_le_plaintext() {
+        use std::sync::mpsc::channel;
+        use std::sync::atomic::AtomicBool;
+
+        // 模拟一段较长的 ASCII 明文 (HTTP form body 风格)
+        let plaintext = b"ACCOUNT=admin&TOKEN=abc123XYZ&NONCE=987654321&TS=1779876015";
+        // SHA-1 摘要
+        let ct = {
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(plaintext);
+            h.finalize().to_vec()
+        };
+
+        // 构造 dump: UTF-16 LE 编码的明文, 周围塞二进制噪声
+        let mut dump: Vec<u8> = Vec::new();
+        dump.extend_from_slice(&[0xCC, 0xCC, 0xCC, 0xCC, 0x00, 0xFF, 0x80, 0xA0]);
+        for &b in plaintext {
+            dump.push(b);
+            dump.push(0x00); // UTF-16 LE: ASCII char + 0x00
+        }
+        dump.extend_from_slice(&[0xCC, 0xCC, 0xCC, 0xCC]);
+
+        let (tx, rx) = channel();
+        let stop = AtomicBool::new(false);
+        let hits = streaming_hash_match(
+            &[Arc::new(dump)],
+            &ct,
+            &[(AlgoKind::Sha1, "SHA-1")],
+            STRING_MIN_LEN,
+            HASH_REVERSE_MAX_LEN,
+            &stop,
+            &tx,
+            Instant::now(),
+        );
+        drop(tx);
+        assert!(hits >= 1, "UTF-16 LE 二遍扫描应命中明文的 SHA-1");
+
+        let mut found = false;
+        for m in rx.iter() {
+            if let EngineMsg::Hit { plain_full: Some(p), .. } = m {
+                if p == plaintext {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "Hit 消息里 plain_full 应等于原始 ASCII 明文");
+    }
+
+    /// 回归: 被哈希的 HTTP 明文里几乎一定有 \n 换行 (CRLF / LF 行分隔 form-data
+    /// 或多行 JSON), 第一遍 ASCII 扫描必须把 \n 当作字符串内部字节而非分隔符,
+    /// 否则整段被切碎, hash 比对永远命中不了。
+    #[test]
+    fn streaming_hash_finds_plaintext_with_newlines() {
+        use std::sync::mpsc::channel;
+        use std::sync::atomic::AtomicBool;
+
+        // 模拟 multipart/form-data 风格的多行明文
+        let plaintext = b"ACCOUNT=admin\r\nTOKEN=abc123XYZ\r\nNONCE=987\r\nTS=1779876015";
+        let ct = {
+            use sha1::{Digest, Sha1};
+            let mut h = Sha1::new();
+            h.update(plaintext);
+            h.finalize().to_vec()
+        };
+
+        // dump = 二进制噪声 + 明文 + 噪声
+        let mut dump: Vec<u8> = Vec::new();
+        dump.extend_from_slice(&[0x00; 4096]);
+        dump.extend_from_slice(plaintext);
+        dump.push(0x00);
+        dump.extend_from_slice(&[0xCC; 4096]);
+
+        let (tx, rx) = channel();
+        let stop = AtomicBool::new(false);
+        let hits = streaming_hash_match(
+            &[Arc::new(dump)],
+            &ct,
+            &[(AlgoKind::Sha1, "SHA-1")],
+            STRING_MIN_LEN,
+            HASH_REVERSE_MAX_LEN,
+            &stop,
+            &tx,
+            Instant::now(),
+        );
+        drop(tx);
+        assert!(hits >= 1, "含 \\r\\n 的明文应该被识别为一整段并命中");
+
+        let mut found = false;
+        for m in rx.iter() {
+            if let EngineMsg::Hit { plain_full: Some(p), .. } = m {
+                if p == plaintext {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "Hit 消息里 plain_full 应等于含换行的完整明文");
     }
 
     /// 回归: 流式对称扫描能从 dump 里恢复加密 key, 即使 key 在偏后位置 (跳过旧的 5M 上限)
