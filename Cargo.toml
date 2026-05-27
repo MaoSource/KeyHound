@@ -1,5 +1,5 @@
 [package]
-name = "algo_tool"
+name = "keyhound"
 version = "0.1.0"
 edition = "2021"
 
@@ -46,6 +46,9 @@ base64 = "0.22"
 # Concurrency / file dialog
 rayon = "1.10"
 rfd = "0.14"
+
+# PNG 解码 (仅用于加载窗口图标)
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.dev]
 opt-level = 1

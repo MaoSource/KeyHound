@@ -84,38 +84,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "algo_tool"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "base64 0.22.1",
- "cbc",
- "cfb-mode",
- "chacha20",
- "cipher",
- "ctr",
- "des",
- "digest",
- "ecb",
- "eframe",
- "egui",
- "egui_extras",
- "hex",
- "hmac",
- "md-5",
- "rayon",
- "rc4",
- "rfd",
- "ripemd",
- "sha1",
- "sha2",
- "sha3",
- "sm3",
- "sm4",
-]
-
-[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1607,6 +1575,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
 dependencies = [
  "cpufeatures",
+]
+
+[[package]]
+name = "keyhound"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "base64 0.22.1",
+ "cbc",
+ "cfb-mode",
+ "chacha20",
+ "cipher",
+ "ctr",
+ "des",
+ "digest",
+ "ecb",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "hex",
+ "hmac",
+ "image",
+ "md-5",
+ "rayon",
+ "rc4",
+ "rfd",
+ "ripemd",
+ "sha1",
+ "sha2",
+ "sha3",
+ "sm3",
+ "sm4",
 ]
 
 [[package]]

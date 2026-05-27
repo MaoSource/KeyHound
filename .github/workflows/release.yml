@@ -18,11 +18,11 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: pt_login.exe
-            asset_name: pt_login-windows-x86_64.exe
+            artifact_name: keyhound.exe
+            asset_name: KeyHound-windows-x86_64.exe
           - os: macos-latest
-            artifact_name: pt_login
-            asset_name: pt_login-macos-universal
+            artifact_name: keyhound
+            asset_name: KeyHound-macos-universal
 
     steps:
       - name: Checkout code
@@ -46,9 +46,9 @@ jobs:
           cargo build --release --target x86_64-apple-darwin
           cargo build --release --target aarch64-apple-darwin
           mkdir -p target/release
-          lipo -create target/x86_64-apple-darwin/release/pt_login \
-                      target/aarch64-apple-darwin/release/pt_login \
-               -output target/release/pt_login
+          lipo -create target/x86_64-apple-darwin/release/keyhound \
+                      target/aarch64-apple-darwin/release/keyhound \
+               -output target/release/keyhound
 
       - name: Prepare Assets
         shell: bash
