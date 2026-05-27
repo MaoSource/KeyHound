@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: pt_login.exe
+            asset_name: pt_login-windows-x86_64.exe
+          - os: macos-latest
+            artifact_name: pt_login
+            asset_name: pt_login-macos-universal
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        run: cargo build --release
+
+      - name: Build (macOS Universal)
+        if: matrix.os == 'macos-latest'
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p target/release
+          lipo -create target/x86_64-apple-darwin/release/pt_login \
+                      target/aarch64-apple-darwin/release/pt_login \
+               -output target/release/pt_login
+
+      - name: Prepare Assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/release/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
+          else
+            cp target/release/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
+            chmod +x dist/${{ matrix.asset_name }}
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
