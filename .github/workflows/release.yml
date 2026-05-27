@@ -18,11 +18,9 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact_name: keyhound.exe
             asset_name: KeyHound-windows-x86_64.exe
           - os: macos-latest
-            artifact_name: keyhound
-            asset_name: KeyHound-macos-universal
+            asset_name: KeyHound-macos-universal.zip
 
     steps:
       - name: Checkout code
@@ -50,16 +48,61 @@ jobs:
                       target/aarch64-apple-darwin/release/keyhound \
                -output target/release/keyhound
 
-      - name: Prepare Assets
+      - name: Prepare Assets (Windows)
+        if: matrix.os == 'windows-latest'
         shell: bash
         run: |
           mkdir -p dist
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/release/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
-          else
-            cp target/release/${{ matrix.artifact_name }} dist/${{ matrix.asset_name }}
-            chmod +x dist/${{ matrix.asset_name }}
-          fi
+          cp target/release/keyhound.exe dist/${{ matrix.asset_name }}
+
+      - name: Prepare Assets (macOS .app bundle)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          mkdir -p dist
+          APP="dist/KeyHound.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          # 把通用二进制放到 Contents/MacOS/
+          cp target/release/keyhound "$APP/Contents/MacOS/keyhound"
+          chmod +x "$APP/Contents/MacOS/keyhound"
+
+          # 由 PNG 生成多分辨率 icns
+          mkdir -p icon.iconset
+          sips -z 16 16     assets/icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     assets/icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     assets/icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     assets/icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   assets/icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   assets/icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   assets/icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512   assets/icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512   assets/icon.png --out icon.iconset/icon_512x512.png
+          cp assets/icon.png icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
+
+          # Info.plist (最小可用集)
+          cat > "$APP/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>KeyHound</string>
+            <key>CFBundleDisplayName</key><string>KeyHound</string>
+            <key>CFBundleIdentifier</key><string>com.maosource.keyhound</string>
+            <key>CFBundleExecutable</key><string>keyhound</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>CFBundleVersion</key><string>0.1.1</string>
+            <key>CFBundleShortVersionString</key><string>0.1.1</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>10.13</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # 压成 zip (.app 本身是目录, GitHub Release 上传需要单文件)
+          (cd dist && zip -r -y "${{ matrix.asset_name }}" KeyHound.app && rm -rf KeyHound.app)
 
       - name: Release
         uses: softprops/action-gh-release@v2
