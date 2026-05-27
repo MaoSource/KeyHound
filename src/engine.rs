@@ -26,9 +26,11 @@ use rayon::prelude::*;
 const MAX_CANDIDATES: usize = 5_000_000;
 /// 字符串扫描产出的最大数量 (仅用于非流式路径)
 const MAX_STRINGS: usize = 20_000_000;
-/// 字符串扫描的长度范围 (字节)
+/// 字符串扫描的长度下限 (字节)
 const STRING_MIN_LEN: usize = 4;
-const STRING_MAX_LEN: usize = 4096;
+/// 哈希反查的最大候选长度上限。哈希明文可以是整段 HTTP 请求体 / 长 JSON,
+/// 设上限会把"超长但确实是被哈希的整体"漏掉, 因此不设上限。
+const HASH_REVERSE_MAX_LEN: usize = usize::MAX;
 
 // ─── 块密码模式 type alias ─────────────────────────────────────────
 
@@ -1673,7 +1675,7 @@ fn run_job(
             &ct,
             &hash_pairs,
             STRING_MIN_LEN,
-            STRING_MAX_LEN,
+            HASH_REVERSE_MAX_LEN,
             &stop,
             &tx,
             t0,
@@ -1839,10 +1841,11 @@ fn run_job(
                         format!(
                             "流式 {} 反查扫完整个 dump 均未命中。可能原因:\
                              (1) 明文不在该 dump 里; \
-                             (2) 明文以二进制/非 ASCII 形式存在; \
-                             (3) 明文长度超过 {} 字节或被多段拼接构成。\
+                             (2) 明文含非可打印字节 (0x00-0x1f / 0x7f / 0x80-0xff) 被切碎;\
+                             (3) 明文是更长 ASCII 段的子串, 整段被当成一条 hash 候选;\
+                             (4) dump 里的明文已被覆盖 / 释放。\
                              可直接在 '已知明文' 字段贴入候选明文验证",
-                            h, STRING_MAX_LEN
+                            h
                         ),
                         true,
                     );
@@ -2047,7 +2050,7 @@ mod tests {
         let strings = extract_strings(
             &[Arc::new(dump)],
             STRING_MIN_LEN,
-            STRING_MAX_LEN,
+            HASH_REVERSE_MAX_LEN,
             MAX_STRINGS,
             None,
             None,
@@ -2087,7 +2090,7 @@ mod tests {
             &ct,
             &[(AlgoKind::Md5, "MD5")],
             STRING_MIN_LEN,
-            STRING_MAX_LEN,
+            HASH_REVERSE_MAX_LEN,
             &stop,
             &tx,
             Instant::now(),
