@@ -4,9 +4,12 @@
 //  * 一个 spawn 调用启动一个 OS 工作线程, 内部用 rayon 并发跑 (algo × key)
 //  * 通过 mpsc::Receiver<EngineMsg> 把日志/进度/命中/完成事件喂回 UI
 //  * 通过 Arc<AtomicBool> stop 让 UI 端按"停止"按钮中断
-//  * IV 约定: CBC/CFB/CTR 用密文前一个块, GCM 用前 12 字节, ChaCha20 用前 12 字节, ECB 无 IV
-//  * 命中判据按强度从高到低: 关键字 → JSON 结构 → ASCII 可打印率 ≥ 阈值
-//    PKCS#7 解填充失败已经在 try_decrypt 内部隐式过滤掉了大部分错误 key
+//  * IV 约定: CBC 系同时试两种 —— ① 前置 IV (密文前一块) ② 无前置 IV/零 IV
+//    (整段都是密文, 真 IV 不在密文里; CBC 下 IV 只影响首块, 故首块外明文照样正确,
+//    判据跳过首块即可命中)。CFB/CTR/GCM/ChaCha20 用密文头部前若干字节, ECB 无 IV
+//  * 命中判据按强度从高到低: 关键字 → 完整 JSON → JSON 尾部(首块未知) → ASCII 可打印率
+//    PKCS#7 解填充失败已经在 try_decrypt 内部隐式过滤掉了大部分错误 key。结构判据用
+//    「文本占比」(含合法 UTF-8 多字节), 中日韩明文不会被 ASCII 阈值误杀
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -218,6 +221,62 @@ fn is_printable_ascii(b: &[u8]) -> bool {
     !b.is_empty() && b.iter().all(|&c| (0x20..=0x7e).contains(&c))
 }
 
+/// 多字节 UTF-8 起始字节对应的序列长度 (2/3/4);非起始字节返回 0。
+#[inline]
+fn utf8_seq_len(c: u8) -> usize {
+    match c {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+/// 统计「文本字节」数: 可打印 ASCII (含 \t\n\r) + 构成合法 UTF-8 多字节序列的字节。
+///
+/// 关键: 随机 AES 输出里高位字节几乎构不成合法 UTF-8 (3 字节字符的概率 ≈ 0.4%),
+/// 所以这个计数对乱码依然是强过滤;但中日韩等 UTF-8 文本能被算作文本, 不再误杀。
+/// 容忍块首/块尾各一个被截断的多字节字符。
+fn text_byte_count(b: &[u8]) -> usize {
+    let n = b.len();
+    let mut text = 0usize;
+    let mut i = 0usize;
+    while i < n {
+        let c = b[i];
+        if c == b'\t' || c == b'\n' || c == b'\r' || (0x20..=0x7e).contains(&c) {
+            text += 1;
+            i += 1;
+            continue;
+        }
+        let seq = utf8_seq_len(c);
+        if seq >= 2 {
+            if i + seq <= n && b[i + 1..i + seq].iter().all(|&x| (0x80..=0xbf).contains(&x)) {
+                text += seq;
+                i += seq;
+                continue;
+            }
+            // 块尾被截断的多字节字符: 计为文本, 结束
+            if i + seq > n {
+                text += n - i;
+                break;
+            }
+        }
+        // 其余 (控制字节 / 孤立高位字节 / 连续字节开头) 视为噪声
+        i += 1;
+    }
+    text
+}
+
+/// 文本占比 (见 [`text_byte_count`])。空切片返回 0。
+#[inline]
+fn text_ratio(b: &[u8]) -> f32 {
+    if b.is_empty() {
+        0.0
+    } else {
+        text_byte_count(b) as f32 / b.len() as f32
+    }
+}
+
 /// 「非控制字符段」定义: 字节 ∈ [0x20..=0x7e] ∪ [0x80..=0xff]
 /// (即排除 0x00-0x1f 控制字符)。模仿 HZJQF/help_tool 的
 /// `pattern_all = [ -~\x80-\xff]{4,}` 策略。
@@ -278,12 +337,9 @@ fn looks_promising_sym(kind: AlgoKind, key: &[u8], ct: &[u8]) -> bool {
 
     #[inline]
     fn ascii_pass(b: &[u8]) -> bool {
-        // 75% 阈值, 容忍少量非可打印字符 (e.g. JSON 里偶尔的 0x00 之类)
-        let printable = b
-            .iter()
-            .filter(|&&c| c == b'\n' || c == b'\r' || c == b'\t' || (0x20..=0x7e).contains(&c))
-            .count();
-        printable * 4 >= b.len() * 3
+        // 75% 阈值, 容忍少量非文本字节。文本 = 可打印 ASCII + 合法 UTF-8 多字节,
+        // 所以含中日韩字符的明文块 (e.g. {"name":"韦成遥") 不会被误杀。
+        text_byte_count(b) * 4 >= b.len() * 3
     }
 
     match kind {
@@ -868,6 +924,8 @@ pub fn streaming_dump_match(
     let hits = AtomicUsize::new(0);
     let scanned = AtomicUsize::new(0);
     let chunks_done = AtomicUsize::new(0);
+    // IV 恢复全 dump 扫描代价不小, 整个任务只做一次 (首个「首块未知」命中触发)
+    let iv_search_done = AtomicBool::new(false);
 
     // 工作项: (源索引, 起始偏移, 结束偏移, 长度)
     // 每个 chunk = 8 MB 起始范围, rayon 自动负载均衡到所有线程
@@ -981,20 +1039,80 @@ pub fn streaming_dump_match(
                         if !looks_promising_sym(kind, win, ct) {
                             continue;
                         }
-                        let Some(pt) = try_decrypt(kind, win, ct) else { continue };
-                        let Some(meta) = judge_hit(&pt, plain_contains) else { continue };
+                        // 枚举各 IV 约定的解密结果, 选「最可信」的一条。关键: 关键字/明文
+                        // 尾部在两种约定里都能命中 (它们共享首块之后的字节), 不能据此偏向
+                        // 前置 IV —— 否则会把真首块当 IV 吃掉。正确判据是「明文是否完整」:
+                        //  · 完整 (去掉 skip 后以 {/[ 开头) → 真前置 IV/真首块, 取 skip 最小的;
+                        //  · 都不完整 → 真无前置 IV, 取 skip 最大的 (它能反查 IV 补回首块)。
+                        let mut cands: Vec<(DecryptAttempt, HitMeta)> = decrypt_attempts(kind, win, ct)
+                            .into_iter()
+                            .filter_map(|att| {
+                                judge_hit_inner(&att.plain, plain_contains, att.judge_skip)
+                                    .map(|m| (att, m))
+                            })
+                            .collect();
+                        if cands.is_empty() {
+                            continue;
+                        }
+                        cands.sort_by_key(|(att, _)| {
+                            if attempt_is_complete(att) {
+                                (0i32, att.judge_skip as i32) // 完整: skip 小者优先
+                            } else {
+                                (1i32, -(att.judge_skip as i32)) // 不完整: skip 大者优先
+                            }
+                        });
+                        let (att, meta) = cands.into_iter().next().unwrap();
 
                         hits.fetch_add(1, Ordering::Relaxed);
-                    let preview = make_preview(&pt);
+
+                    // 首块未知 (无前置 IV): 整个任务首次命中时, 在 dump 里找回真实 IV,
+                    // 把乱码首块补成完整明文。
+                    let mut iv_hex = att.iv_hex.clone();
+                    let mut full_plain = att.plain.clone();
+                    let mut reason = meta.reason.to_string();
+                    let mut skip = att.judge_skip;
+                    if skip > 0
+                        && iv_search_done
+                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        log(tx_local, MsgLvl::Info, "首块未知 · 正在 dump 中反查 IV…", false);
+                        if let Some((iv, recovered)) =
+                            recover_cbc_iv(kind, win, ct, &att.plain, sources, stop)
+                        {
+                            iv_hex = Some(hex::encode(&iv));
+                            full_plain = recovered;
+                            // 去掉判据里的「(首块未知)」尾巴, 换成「IV 已恢复」
+                            reason = format!("{} · IV 已恢复", meta.reason.replace("(首块未知)", ""));
+                            skip = 0;
+                            log(
+                                tx_local,
+                                MsgLvl::Ok,
+                                format!("IV 反查成功: {}", hex::encode(&iv)),
+                                true,
+                            );
+                        } else {
+                            if !reason.contains("首块未知") {
+                                reason = format!("{} · 首块未知", reason);
+                            }
+                            log(tx_local, MsgLvl::Warn, "IV 未在 dump 中找到, 首块仍未知", false);
+                        }
+                    }
+
+                    // 首块仍未知时预览跳过乱码前缀, 并标注
+                    let preview = if skip > 0 && full_plain.len() > skip {
+                        format!(
+                            "⟨前 {}B 首块未知⟩ {}",
+                            skip,
+                            make_preview(&full_plain[skip..])
+                        )
+                    } else {
+                        make_preview(&full_plain)
+                    };
                     log(
                         tx_local,
                         MsgLvl::Ok,
-                        format!(
-                            "命中 {} · key={} · {}",
-                            name,
-                            hex_short(win),
-                            meta.reason
-                        ),
+                        format!("命中 {} · key={} · {}", name, hex_short(win), reason),
                         true,
                     );
                     send(
@@ -1002,10 +1120,10 @@ pub fn streaming_dump_match(
                         EngineMsg::Hit {
                             algo: algo_display_name(kind, win.len()),
                             key_hex: format_key_hex(win),
-                            iv_hex: extract_iv(kind, ct).map(|b| hex::encode(b)),
+                            iv_hex,
                             plain_preview: Some(preview),
-                            plain_full: Some(pt.clone()),
-                            reason: meta.reason.to_string(),
+                            plain_full: Some(full_plain),
+                            reason,
                             elapsed_ms: t0.elapsed().as_millis() as u64,
                         },
                     );
@@ -1378,6 +1496,402 @@ pub fn try_decrypt(kind: AlgoKind, key: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// CBC 系算法的「无前置 IV」约定: 整段密文都是密文 (不切掉前 16/8 字节当 IV),
+/// 用全零 IV 解密。
+///
+/// 原理: CBC 解密里 IV 只异或到第一个明文块, 第 2 块往后只依赖前一个密文块,
+/// 与 IV 无关。所以即使不知道真实 IV, 只要 key 对, 除首块外的明文全部正确,
+/// PKCS#7 padding (在最后一块) 也能正常校验通过。首块是乱码, 判据需跳过。
+/// 真实 IV 可在已知首块明文后用 `IV = Decrypt(K, C_1) XOR P_1` 反推, 这里不做。
+fn try_decrypt_cbc_zero_iv(kind: AlgoKind, key: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
+    const B16: usize = 16;
+    const B8: usize = 8;
+    match kind {
+        AlgoKind::AesCbc => {
+            if ct.len() < 2 * B16 || ct.len() % B16 != 0 {
+                return None;
+            }
+            let iv = [0u8; B16];
+            let mut buf = vec![0u8; ct.len()];
+            let pt = match key.len() {
+                16 => Aes128CbcDec::new_from_slices(key, &iv).ok()?
+                    .decrypt_padded_b2b_mut::<Pkcs7>(ct, &mut buf).ok()?,
+                24 => Aes192CbcDec::new_from_slices(key, &iv).ok()?
+                    .decrypt_padded_b2b_mut::<Pkcs7>(ct, &mut buf).ok()?,
+                32 => Aes256CbcDec::new_from_slices(key, &iv).ok()?
+                    .decrypt_padded_b2b_mut::<Pkcs7>(ct, &mut buf).ok()?,
+                _ => return None,
+            };
+            Some(pt.to_vec())
+        }
+        AlgoKind::Sm4Cbc => {
+            if key.len() != 16 || ct.len() < 2 * B16 || ct.len() % B16 != 0 {
+                return None;
+            }
+            let iv = [0u8; B16];
+            let mut buf = vec![0u8; ct.len()];
+            let pt = Sm4CbcDec::new_from_slices(key, &iv).ok()?
+                .decrypt_padded_b2b_mut::<Pkcs7>(ct, &mut buf).ok()?;
+            Some(pt.to_vec())
+        }
+        AlgoKind::DesCbc => {
+            if key.len() != 8 || ct.len() < 2 * B8 || ct.len() % B8 != 0 {
+                return None;
+            }
+            let iv = [0u8; B8];
+            let mut buf = vec![0u8; ct.len()];
+            let pt = DesCbcDec::new_from_slices(key, &iv).ok()?
+                .decrypt_padded_b2b_mut::<Pkcs7>(ct, &mut buf).ok()?;
+            Some(pt.to_vec())
+        }
+        AlgoKind::TdesCbc => {
+            if key.len() != 24 || ct.len() < 2 * B8 || ct.len() % B8 != 0 {
+                return None;
+            }
+            let iv = [0u8; B8];
+            let mut buf = vec![0u8; ct.len()];
+            let pt = TdesCbcDec::new_from_slices(key, &iv).ok()?
+                .decrypt_padded_b2b_mut::<Pkcs7>(ct, &mut buf).ok()?;
+            Some(pt.to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// 一次解密尝试: 明文 + 对应的 IV (None = 未知) + 判据要跳过的不可信前缀字节数。
+pub struct DecryptAttempt {
+    pub plain: Vec<u8>,
+    pub iv_hex: Option<String>,
+    /// 无前置 IV 约定下首块是乱码, 判据/预览要跳过这么多字节。
+    pub judge_skip: usize,
+}
+
+/// 对 (kind, key, ct) 枚举所有「IV 约定」下的解密结果。
+///
+/// CBC 系: 同时给出 ① 前置 IV (密文前一块当 IV) 和 ② 无前置 IV (整段密文, 零 IV,
+/// 首块未知) 两种解读, 交给判据各自筛。真实报文通常只有一种约定能通过判据,
+/// 因此不会重复刷屏 (见 scan 循环里 strong/weak 的取舍)。其它算法走原 `try_decrypt` 单路。
+pub fn decrypt_attempts(kind: AlgoKind, key: &[u8], ct: &[u8]) -> Vec<DecryptAttempt> {
+    let bs = match kind {
+        AlgoKind::AesCbc | AlgoKind::Sm4Cbc => 16,
+        AlgoKind::DesCbc | AlgoKind::TdesCbc => 8,
+        _ => 0,
+    };
+    if bs == 0 {
+        // 非 CBC: 沿用既有单路约定 (IV 取密文头部)
+        return match try_decrypt(kind, key, ct) {
+            Some(pt) => vec![DecryptAttempt {
+                plain: pt,
+                iv_hex: extract_iv(kind, ct).map(hex::encode),
+                judge_skip: 0,
+            }],
+            None => vec![],
+        };
+    }
+    let mut out = Vec::with_capacity(2);
+    // 约定 ①: 前置 IV
+    if let Some(pt) = try_decrypt(kind, key, ct) {
+        out.push(DecryptAttempt {
+            plain: pt,
+            iv_hex: Some(hex::encode(&ct[..bs])),
+            judge_skip: 0,
+        });
+    }
+    // 约定 ②: 无前置 IV / 零 IV, 首块未知
+    if let Some(pt) = try_decrypt_cbc_zero_iv(kind, key, ct) {
+        out.push(DecryptAttempt {
+            plain: pt,
+            iv_hex: None,
+            judge_skip: bs,
+        });
+    }
+    out
+}
+
+/// 判断一次解密尝试是否给出「完整」明文: 去掉不可信前缀 (judge_skip) 后, 文本以
+/// `{` 或 `[` 开头 —— 即真实首块就在结果里 (前置 IV 约定正确)。不完整说明真首块被
+/// 当成了 IV, 需要无前置 IV 约定 + IV 反查来补回。
+fn attempt_is_complete(att: &DecryptAttempt) -> bool {
+    if att.plain.len() <= att.judge_skip {
+        return false;
+    }
+    let s = String::from_utf8_lossy(&att.plain[att.judge_skip..]);
+    let t = s.trim_start();
+    t.starts_with('{') || t.starts_with('[')
+}
+
+/// CBC 系算法的块大小 (字节);非 CBC 返回 0。
+fn cbc_block_size(kind: AlgoKind) -> usize {
+    match kind {
+        AlgoKind::AesCbc | AlgoKind::Sm4Cbc => 16,
+        AlgoKind::DesCbc | AlgoKind::TdesCbc => 8,
+        _ => 0,
+    }
+}
+
+/// 对 CBC 系算法做单块 ECB 解密 (即裸 `Decrypt(K, block)`, 不异或、不去填充)。
+fn ecb_decrypt_block(kind: AlgoKind, key: &[u8], block: &[u8]) -> Option<Vec<u8>> {
+    use cipher::generic_array::GenericArray;
+    use cipher::{BlockDecrypt, KeyInit};
+    let bs = cbc_block_size(kind);
+    if bs == 0 || block.len() < bs {
+        return None;
+    }
+    // 16 字节块 (AES / SM4)
+    if bs == 16 {
+        let mut b = GenericArray::clone_from_slice(&block[..16]);
+        match kind {
+            AlgoKind::AesCbc => match key.len() {
+                16 => aes::Aes128::new_from_slice(key).ok()?.decrypt_block(&mut b),
+                24 => aes::Aes192::new_from_slice(key).ok()?.decrypt_block(&mut b),
+                32 => aes::Aes256::new_from_slice(key).ok()?.decrypt_block(&mut b),
+                _ => return None,
+            },
+            AlgoKind::Sm4Cbc if key.len() == 16 => {
+                sm4::Sm4::new_from_slice(key).ok()?.decrypt_block(&mut b)
+            }
+            _ => return None,
+        }
+        return Some(b.to_vec());
+    }
+    // 8 字节块 (DES / 3DES)
+    let mut b = GenericArray::clone_from_slice(&block[..8]);
+    match kind {
+        AlgoKind::DesCbc if key.len() == 8 => {
+            des::Des::new_from_slice(key).ok()?.decrypt_block(&mut b)
+        }
+        AlgoKind::TdesCbc if key.len() == 24 => {
+            des::TdesEde3::new_from_slice(key).ok()?.decrypt_block(&mut b)
+        }
+        _ => return None,
+    }
+    Some(b.to_vec())
+}
+
+/// 已知 key + 无前置 IV 的密文后, 尝试恢复真实 IV, 从而补出乱码的首块明文。
+///
+/// 原理: `D = Decrypt(K, C₀) = P₀ XOR IV`, 故 `P₀ = D XOR IV`。固定/写死的 IV 几乎
+/// 总能在内存 dump 里找到, 所以在 dump 里找 16(或 8) 字节窗口 W, 使 `D XOR W` 是合法
+/// JSON 头部 (`{"…` 或 `[…`, 且整块是文本) —— 命中即 IV = W。先试几个常见启发式 IV
+/// (全 FF / key 前缀), 再全 dump 扫描。
+///
+/// `body_plain` 是约定②解出的明文 (首块乱码, 其余正确)。返回 (iv, 完整明文)。
+pub fn recover_cbc_iv(
+    kind: AlgoKind,
+    key: &[u8],
+    ct: &[u8],
+    body_plain: &[u8],
+    sources: &[Arc<Vec<u8>>],
+    stop: &AtomicBool,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let bs = cbc_block_size(kind);
+    if bs == 0 || ct.len() < bs || body_plain.len() < bs {
+        return None;
+    }
+    let d = ecb_decrypt_block(kind, key, &ct[..bs])?;
+    let tail = &body_plain[bs..]; // 首块之后的明文, 已正确
+
+    // 候选 IV 验证 (排除假阳性的关键, 两道一起卡):
+    //  ① 恢复出的首块 P₀ 必须是「干净的 JSON 对象开头」: `{"` + 仅 key 安全字符。
+    //     光是 JSON 良构不够 —— `{"<14 个随机可打印字节>` 也能当成一个怪 key, 4.6GB
+    //     里这种能凑出上万个。限定 P₀ 全是 [字母数字 _-.":,{}[] 空格] 后, 假阳性 ~0。
+    //  ② 拼上真实尾部后, 整体必须是良构 JSON。
+    let clean_obj_head = |p0: &[u8]| -> bool {
+        p0.first() == Some(&b'{')
+            && p0.get(1) == Some(&b'"')
+            && p0
+                .iter()
+                .all(|&c| c.is_ascii_alphanumeric() || b"_-.\"':,{}[] ".contains(&c))
+    };
+    let try_iv = |iv: &[u8]| -> Option<(Vec<u8>, Vec<u8>)> {
+        let p0: Vec<u8> = d.iter().zip(iv.iter()).map(|(a, b)| a ^ b).collect();
+        if !clean_obj_head(&p0) {
+            return None;
+        }
+        let mut full = p0;
+        full.extend_from_slice(tail);
+        if json_well_formed(&String::from_utf8_lossy(&full)) {
+            Some((iv.to_vec(), full))
+        } else {
+            None
+        }
+    };
+
+    // 1) 常见启发式 IV
+    let mut heur: Vec<Vec<u8>> = vec![vec![0x00u8; bs], vec![0xFFu8; bs]];
+    if key.len() >= bs {
+        heur.push(key[..bs].to_vec());
+    }
+    if key.len() >= 2 * bs {
+        heur.push(key[bs..2 * bs].to_vec());
+    }
+    for iv in &heur {
+        if let Some(r) = try_iv(iv) {
+            return Some(r);
+        }
+    }
+
+    // 2) 全 dump 扫描 (IV 通常是写死常量, 在内存里)。
+    //    热路径无分配: 先用前两字节 (P₀ 的开头 `{"` / `[`) 做廉价预筛, 命中再做 JSON 校验。
+    let d0 = d[0];
+    let d1 = d[1];
+    for src in sources {
+        let s = src.as_slice();
+        if s.len() < bs {
+            continue;
+        }
+        let mut i = 0usize;
+        let last = s.len() - bs;
+        while i <= last {
+            if (i & 0x3F_FFFF) == 0 && stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            // P₀[0..2] = d[0..2] XOR W[0..2]; 只对以 `{"` 开头的候选做完整校验
+            if d0 ^ s[i] == b'{' && d1 ^ s[i + 1] == b'"' {
+                if let Some(r) = try_iv(&s[i..i + bs]) {
+                    return Some(r);
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// 轻量 JSON 良构性校验 (不引入依赖)。整串必须恰好是一个合法 JSON 值 (对象/数组/
+/// 字符串/数字/true/false/null), 前后允许空白。用于 IV 反查时排除「尾部像 JSON 但
+/// 首块是乱码」的假阳性。字符串值里的多字节 UTF-8 照单全收, 控制字符视为非法。
+fn json_well_formed(s: &str) -> bool {
+    let mut p = JsonParser { b: s.as_bytes(), i: 0 };
+    p.skip_ws();
+    if !p.value() {
+        return false;
+    }
+    p.skip_ws();
+    p.i == p.b.len()
+}
+
+struct JsonParser<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl JsonParser<'_> {
+    fn skip_ws(&mut self) {
+        while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
+            self.i += 1;
+        }
+    }
+    fn value(&mut self) -> bool {
+        match self.b.get(self.i) {
+            Some(b'{') => self.object(),
+            Some(b'[') => self.array(),
+            Some(b'"') => self.string(),
+            Some(b't') => self.lit(b"true"),
+            Some(b'f') => self.lit(b"false"),
+            Some(b'n') => self.lit(b"null"),
+            Some(b'-') | Some(b'0'..=b'9') => self.number(),
+            _ => false,
+        }
+    }
+    fn lit(&mut self, kw: &[u8]) -> bool {
+        if self.b[self.i..].starts_with(kw) {
+            self.i += kw.len();
+            true
+        } else {
+            false
+        }
+    }
+    fn string(&mut self) -> bool {
+        self.i += 1; // 跳过开引号
+        while let Some(&c) = self.b.get(self.i) {
+            match c {
+                b'"' => {
+                    self.i += 1;
+                    return true;
+                }
+                b'\\' => {
+                    self.i += 1;
+                    if self.i >= self.b.len() {
+                        return false;
+                    }
+                    self.i += 1; // 接受任意转义 (含 \uXXXX 不细究)
+                }
+                0x00..=0x1f => return false, // JSON 字符串里控制字符非法
+                _ => self.i += 1,
+            }
+        }
+        false
+    }
+    fn number(&mut self) -> bool {
+        let start = self.i;
+        if self.b.get(self.i) == Some(&b'-') {
+            self.i += 1;
+        }
+        while self.i < self.b.len()
+            && matches!(self.b[self.i], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+        {
+            self.i += 1;
+        }
+        self.i > start
+    }
+    fn object(&mut self) -> bool {
+        self.i += 1; // {
+        self.skip_ws();
+        if self.b.get(self.i) == Some(&b'}') {
+            self.i += 1;
+            return true;
+        }
+        loop {
+            self.skip_ws();
+            if self.b.get(self.i) != Some(&b'"') || !self.string() {
+                return false;
+            }
+            self.skip_ws();
+            if self.b.get(self.i) != Some(&b':') {
+                return false;
+            }
+            self.i += 1;
+            self.skip_ws();
+            if !self.value() {
+                return false;
+            }
+            self.skip_ws();
+            match self.b.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b'}') => {
+                    self.i += 1;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+    fn array(&mut self) -> bool {
+        self.i += 1; // [
+        self.skip_ws();
+        if self.b.get(self.i) == Some(&b']') {
+            self.i += 1;
+            return true;
+        }
+        loop {
+            self.skip_ws();
+            if !self.value() {
+                return false;
+            }
+            self.skip_ws();
+            match self.b.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b']') => {
+                    self.i += 1;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+}
+
 // ─── 哈希 / HMAC 指纹匹配 ─────────────────────────────────────────
 
 /// 比较 hash(key) 是否与期望前缀匹配 (允许 expected 长度等于 hash 长度,或被截断)
@@ -1444,6 +1958,21 @@ pub fn try_hmac(kind: AlgoKind, key: &[u8], msg: &[u8], expected: &[u8]) -> Opti
 
 pub struct HitMeta {
     pub reason: &'static str,
+    /// 强信号 (关键字命中 / 完整 JSON / 高 ASCII 可读)。弱信号 (仅 JSON 尾部) 用于
+    /// 首块未知的无 IV 约定。scan 循环优先报强信号, 避免同一 key 两种约定都刷屏。
+    pub strong: bool,
+}
+
+/// 看起来像「JSON 对象/数组的尾部」: 以 } 或 ] 收尾, 且含 JSON 字段分隔符。
+/// 用于无前置 IV 约定 (首 16 字节是乱码, 拿不到开头的 `{`) 时识别命中。
+fn looks_json_tail(s: &str) -> bool {
+    let t = s.trim();
+    (t.ends_with('}') || t.ends_with(']'))
+        && (t.contains("\":\"")
+            || t.contains("\",\"")
+            || t.contains("\":[")
+            || t.contains("\":{")
+            || t.contains("\":"))
 }
 
 /// 对一次解密产物判断"是否值得作为候选输出给用户"。
@@ -1452,47 +1981,68 @@ pub struct HitMeta {
 ///  * 用户给了 plain_contains → 严格要求子串命中, 不再 fallback 到 ratio 启发式
 ///  * 短输出 (< 24 字节) 不走 ratio 启发式: 16 字节随机 XOR 太容易碰巧像 ASCII
 ///  * ASCII 启发式要求 ratio ≥ 0.95 且字母占比 ≥ 0.25 (避免纯标点/数字假命中)
+///  * 结构判据用「文本占比」(含合法 UTF-8 多字节), 中日韩 JSON 不会被 ratio 卡掉
 pub fn judge_hit(plain: &[u8], plain_contains: &str) -> Option<HitMeta> {
-    if plain.is_empty() {
+    judge_hit_inner(plain, plain_contains, 0)
+}
+
+/// `skip`: 跳过开头不可信的字节 (无前置 IV 约定下首块是乱码)。skip > 0 时只能
+/// 看 JSON 尾部特征, 判定为弱信号 (`strong = false`)。
+pub fn judge_hit_inner(plain: &[u8], plain_contains: &str, skip: usize) -> Option<HitMeta> {
+    if plain.len() <= skip {
         return None;
     }
-    let plain_str = String::from_utf8_lossy(plain);
+    let body = &plain[skip..];
+    let body_str = String::from_utf8_lossy(body);
     let kw = plain_contains.trim();
 
-    // 1. 用户给了关键字: 唯一权威信号; 不命中就直接淘汰
+    // 1. 用户给了关键字: 唯一权威信号; 在可信区间 (跳过首块) 内搜索
     if !kw.is_empty() {
-        if plain_str.contains(kw) {
-            return Some(HitMeta { reason: "关键字命中" });
+        if body_str.contains(kw) {
+            return Some(HitMeta { reason: "关键字命中", strong: true });
         }
         return None;
     }
 
     // 2. 没有关键字: 走结构 / ratio 启发式
-    let printable = plain
-        .iter()
-        .filter(|&&c| c == b'\n' || c == b'\r' || c == b'\t' || (0x20..=0x7e).contains(&c))
-        .count();
-    let ratio = printable as f32 / plain.len() as f32;
-    let s = plain_str.trim();
-    let json_like = (s.starts_with('{') && s.ends_with('}'))
-        || (s.starts_with('[') && s.ends_with(']'));
-    if json_like && ratio >= 0.9 && plain.len() >= 12 {
-        return Some(HitMeta { reason: "JSON 结构" });
+    let s = body_str.trim();
+    let txt = text_ratio(body); // 含合法 UTF-8 多字节, 兼容 CJK
+    if skip == 0 {
+        // 首块可信: 要求完整 JSON 包裹
+        let json_full = (s.starts_with('{') && s.ends_with('}'))
+            || (s.starts_with('[') && s.ends_with(']'));
+        if json_full && txt >= 0.9 && body.len() >= 12 {
+            return Some(HitMeta { reason: "JSON 结构", strong: true });
+        }
+    } else {
+        // 首块未知: 只能看 JSON 尾部特征
+        if txt >= 0.85 && body.len() >= 12 && looks_json_tail(s) {
+            return Some(HitMeta { reason: "JSON 结构(首块未知)", strong: false });
+        }
     }
 
     // 短输出 (< 24 字节) 无足够上下文判断, 不走 ratio
-    if plain.len() < 24 {
+    if body.len() < 24 {
         return None;
     }
 
+    // 纯 ASCII 可读 (这里仍用严格可打印 ASCII 计数, 不放进 UTF-8 文本)
+    let printable = body
+        .iter()
+        .filter(|&&c| c == b'\n' || c == b'\r' || c == b'\t' || (0x20..=0x7e).contains(&c))
+        .count();
+    let ratio = printable as f32 / body.len() as f32;
     if ratio >= 0.95 {
-        let alpha = plain
+        let alpha = body
             .iter()
             .filter(|c| c.is_ascii_alphabetic())
             .count() as f32
-            / plain.len() as f32;
+            / body.len() as f32;
         if alpha >= 0.25 {
-            return Some(HitMeta { reason: "ASCII 可读" });
+            return Some(HitMeta {
+                reason: if skip == 0 { "ASCII 可读" } else { "ASCII 可读(首块未知)" },
+                strong: skip == 0,
+            });
         }
     }
 
@@ -2071,6 +2621,160 @@ mod tests {
             }
         }
         assert!(hit_count >= 1, "应至少命中 1 次 (含正确 key)");
+    }
+
+    /// 回归: 无前置 IV (固定/零 IV) + 含中文的 JSON 明文。
+    /// 这正是「同行能解、本工具 0 命中」的场景: 整段都是密文, 真实 IV 不在密文里。
+    #[test]
+    fn end_to_end_aes256_cbc_no_prepended_iv_cjk() {
+        let key = b"correct horse battery staple!!!!"; // 32 字节
+        // 业务里常见的固定 IV (这里用零 IV); 密文里不携带 IV
+        let iv = [0u8; 16];
+        let plaintext =
+            r#"{"id":"45273","name":"韦成遥","activity_ids":["109658240","109658876"]}"#.as_bytes();
+
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        let ct_len = Aes256CbcEnc::new_from_slices(key, &iv)
+            .unwrap()
+            .encrypt_padded_b2b_mut::<Pkcs7>(plaintext, &mut buf)
+            .unwrap()
+            .len();
+        let ct = buf[..ct_len].to_vec(); // 注意: 不前置 IV
+
+        // 1) 快速首块过滤必须放行正确 key (含中文的明文块以前会被 ASCII 阈值误杀)
+        assert!(
+            looks_promising_sym(AlgoKind::AesCbc, key, &ct),
+            "含中文的明文块不应被首块过滤误杀"
+        );
+
+        // 2) 无前置 IV 约定应解出明文 (首块 16B 未知, 其余正确)
+        let attempts = decrypt_attempts(AlgoKind::AesCbc, key, &ct);
+        let hit = attempts
+            .iter()
+            .filter_map(|a| judge_hit_inner(&a.plain, "", a.judge_skip).map(|m| (a, m)))
+            .next()
+            .expect("应在某个 IV 约定下命中");
+        let (att, _) = hit;
+        // 跳过首块后, 可信区间应是真实明文的尾部
+        let body = String::from_utf8_lossy(&att.plain[att.judge_skip..]);
+        assert!(body.contains("韦成遥"), "应解出中文 name 字段, 实际: {body}");
+        assert!(body.trim_end().ends_with('}'));
+
+        // 3) 给关键字时也应命中 (关键字在首块之后)
+        let with_kw = decrypt_attempts(AlgoKind::AesCbc, key, &ct)
+            .iter()
+            .any(|a| judge_hit_inner(&a.plain, "activity_ids", a.judge_skip).is_some());
+        assert!(with_kw, "关键字 activity_ids 应命中");
+
+        // 4) IV 反查: 把真实 IV 藏进 dump, 应能恢复出完整明文 (含首块)
+        let mut dump = vec![0u8; 8192];
+        dump[4096..4096 + 16].copy_from_slice(&iv); // 真实 IV 写死在内存里
+        let sources = [Arc::new(dump)];
+        let stop = AtomicBool::new(false);
+        let (rec_iv, full) =
+            recover_cbc_iv(AlgoKind::AesCbc, key, &ct, &att.plain, &sources, &stop)
+                .expect("应从 dump 反查到 IV");
+        assert_eq!(rec_iv, iv);
+        assert_eq!(full.as_slice(), plaintext, "应恢复出完整明文 (含 id 首块)");
+        assert!(String::from_utf8_lossy(&full).starts_with("{\"id\":\"45273\""));
+    }
+
+    /// 回归 (截图 bug): 无前置 IV + 用户填了关键字。关键字落在首块之后, 两种约定都能
+    /// 命中 —— 必须选「无前置 IV」约定 (能补回首块), 不能因关键字偏向前置 IV (会把真首块
+    /// 当 IV 吃掉, IV 显示成 C₀, 原文缺 `{"id_card_number`)。
+    #[test]
+    fn keyword_match_prefers_no_prepended_iv() {
+        let key = b"correct horse battery staple!!!!"; // 32 字节
+        let iv = [0x11u8; 16]; // 非零固定 IV, 不在密文里
+        let plaintext = r#"{"id_card_number":"452730198110175943","id_card_name":"韦成遥","phone_number":"15578889287"}"#.as_bytes();
+        assert_eq!(&plaintext[..16], b"{\"id_card_number"); // 首块正好 16 字节
+
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        let ct_len = Aes256CbcEnc::new_from_slices(key, &iv)
+            .unwrap()
+            .encrypt_padded_b2b_mut::<Pkcs7>(plaintext, &mut buf)
+            .unwrap()
+            .len();
+        let ct = buf[..ct_len].to_vec(); // 不前置 IV
+
+        // 复刻 scan 循环的选择逻辑: 关键字命中两种约定, 但应选不完整里 skip 最大的 (约定②)
+        let keyword = "452730198110175943";
+        let mut cands: Vec<(DecryptAttempt, HitMeta)> = decrypt_attempts(AlgoKind::AesCbc, key, &ct)
+            .into_iter()
+            .filter_map(|att| judge_hit_inner(&att.plain, keyword, att.judge_skip).map(|m| (att, m)))
+            .collect();
+        assert!(cands.len() >= 2, "前置/无前置两种约定都应命中关键字");
+        cands.sort_by_key(|(att, _)| {
+            if attempt_is_complete(att) {
+                (0i32, att.judge_skip as i32)
+            } else {
+                (1i32, -(att.judge_skip as i32))
+            }
+        });
+        let (winner, _) = &cands[0];
+        assert!(
+            winner.judge_skip > 0,
+            "应选无前置 IV 约定 (skip>0), 而不是把首块当 IV 的前置约定"
+        );
+        assert!(winner.iv_hex.is_none(), "无前置 IV 约定不应谎报 IV = C₀");
+
+        // IV 反查应补回真首块
+        let mut dump = vec![0u8; 4096];
+        dump[2000..2016].copy_from_slice(&iv);
+        let sources = [Arc::new(dump)];
+        let stop = AtomicBool::new(false);
+        let (rec_iv, full) =
+            recover_cbc_iv(AlgoKind::AesCbc, key, &ct, &winner.plain, &sources, &stop)
+                .expect("应反查到 IV");
+        assert_eq!(rec_iv, iv);
+        assert_eq!(full.as_slice(), plaintext);
+        assert!(String::from_utf8_lossy(&full).starts_with("{\"id_card_number\""));
+    }
+
+    #[test]
+    fn json_validator_basics() {
+        assert!(json_well_formed(r#"{"a":1,"b":[1,2,"x"],"c":{"d":true}}"#));
+        assert!(json_well_formed(r#"{"name":"韦成遥","ids":["1","2"]}"#));
+        assert!(json_well_formed("  [1, 2, 3]  "));
+        // 截图里的假阳性: `[{乱码…` 接真实尾部不是合法 JSON
+        assert!(!json_well_formed(r#"[{nBAJ$A2!T0":"452730","x":"y"}"#));
+        assert!(!json_well_formed(r#"{"a":1"#)); // 未闭合
+        assert!(!json_well_formed(r#"{"a":}"#)); // 缺值
+        assert!(!json_well_formed("not json"));
+    }
+
+    /// 回归 (截图 bug): IV 反查不能把 dump 里碰巧凑出 `{"<乱码>` 的窗口当成 IV。
+    /// 真 IV 不在 dump 里时, 应反查失败 (而不是返回乱码首块)。
+    #[test]
+    fn iv_recovery_rejects_garbage_first_block() {
+        let key = b"correct horse battery staple!!!!";
+        let iv = [0x11u8; 16];
+        let plaintext = r#"{"id_card_number":"452730198110175943","name":"x"}"#.as_bytes();
+        let mut buf = vec![0u8; plaintext.len() + 16];
+        let n = Aes256CbcEnc::new_from_slices(key, &iv)
+            .unwrap()
+            .encrypt_padded_b2b_mut::<Pkcs7>(plaintext, &mut buf)
+            .unwrap()
+            .len();
+        let ct = buf[..n].to_vec();
+        let body = try_decrypt_cbc_zero_iv(AlgoKind::AesCbc, key, &ct).unwrap();
+
+        // 真 IV 不在 dump 里 → 应反查失败, 不返回乱码
+        let noise = [Arc::new(vec![0x5au8; 16384])];
+        let stop = AtomicBool::new(false);
+        assert!(
+            recover_cbc_iv(AlgoKind::AesCbc, key, &ct, &body, &noise, &stop).is_none(),
+            "真 IV 不在 dump 时不应返回任何 (乱码) IV"
+        );
+
+        // 真 IV 在 dump 里 → 应成功且首块正确
+        let mut dump = vec![0x5au8; 16384];
+        dump[9000..9016].copy_from_slice(&iv);
+        let src = [Arc::new(dump)];
+        let (riv, full) =
+            recover_cbc_iv(AlgoKind::AesCbc, key, &ct, &body, &src, &stop).expect("应反查到真 IV");
+        assert_eq!(riv, iv);
+        assert_eq!(full.as_slice(), plaintext);
     }
 
     #[test]

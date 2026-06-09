@@ -140,6 +140,8 @@ pub struct ResultCard {
     pub plain: Option<String>,
     /// 完整明文字节, 给"导出原文"用 (preview 是 UI 截断版)
     pub plain_full: Option<Vec<u8>>,
+    /// 命中判据说明 (e.g. "JSON 结构 · IV 已恢复"、"关键字命中")
+    pub reason: String,
     pub pinned: bool,
 }
 
@@ -748,7 +750,7 @@ impl App {
                     iv_hex,
                     plain_preview,
                     plain_full,
-                    reason: _,
+                    reason,
                     elapsed_ms,
                 } => {
                     let dup = self
@@ -764,6 +766,7 @@ impl App {
                             iv: iv_hex,
                             plain: plain_preview,
                             plain_full,
+                            reason,
                             pinned: false,
                         });
                         self.tab = RightTab::Results;
@@ -3128,6 +3131,23 @@ fn result_card(ui: &mut Ui, t: &Tokens, r: &ResultCard) -> Option<CardAction> {
                 );
             });
         });
+
+        // 判据说明: 为什么这条算命中 (e.g. "JSON 结构 · IV 已恢复")
+        if r.hit && !r.reason.is_empty() {
+            ui.add_space(3.0);
+            // 首块未知/IV 已恢复用 warn 色提示, 其余用次要文字色
+            let color = if r.reason.contains("首块未知") {
+                t.warn
+            } else {
+                t.ink_2
+            };
+            ui.label(
+                RichText::new(format!("· {}", r.reason))
+                    .size(10.5)
+                    .color(color),
+            );
+        }
+
         let box_frame = |hit: bool, t: &Tokens| egui::Frame {
             fill: if hit { t.surface } else { t.bg_sunken },
             stroke: if hit { Stroke::new(1.0, blend_for_border(t)) } else { Stroke::NONE },
